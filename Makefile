@@ -1,8 +1,11 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra
 TOOLS   = netscan.exe portscan.exe wifiscan.exe netwatch.exe routercheck.exe netreport.exe
+ATTACK  = keygen.exe wificrack.exe
 
 all: $(TOOLS)
+
+attack: $(ATTACK)
 
 netscan.exe: netscan.c lantern.h
 	$(CC) $(CFLAGS) -o $@ netscan.c -lws2_32 -liphlpapi
@@ -22,7 +25,13 @@ routercheck.exe: routercheck.c lantern.h
 netreport.exe: netreport.c lantern.h
 	$(CC) $(CFLAGS) -o $@ netreport.c -lws2_32 -liphlpapi -lwlanapi -lole32
 
-clean:
-	rm -f $(TOOLS)
+keygen.exe: keygen.c lantern.h
+	$(CC) $(CFLAGS) -o $@ keygen.c -lws2_32 -liphlpapi -lwlanapi -lole32
 
-.PHONY: all clean
+wificrack.exe: wificrack.c lantern.h
+	$(CC) $(CFLAGS) -o $@ wificrack.c -lws2_32 -liphlpapi -lwlanapi -lole32
+
+clean:
+	rm -f $(TOOLS) $(ATTACK)
+
+.PHONY: all attack clean

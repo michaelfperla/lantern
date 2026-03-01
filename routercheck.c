@@ -83,65 +83,54 @@ static void check_admin_panel(const char *target) {
 
 /* ── Check: Default credentials ──────────────────────────────────── */
 
-typedef struct {
-    const char *user;
-    const char *pass;
-} Credential;
-
-static const Credential DEFAULT_CREDS[] = {
-    {"admin",    "admin"},
-    {"admin",    "password"},
-    {"admin",    "1234"},
-    {"admin",    "12345"},
-    {"admin",    ""},
-    {"root",     "root"},
-    {"root",     "admin"},
-    {"root",     ""},
-    {"user",     "user"},
-    {"admin",    "Admin"},
-};
-
-#define CRED_COUNT (sizeof(DEFAULT_CREDS) / sizeof(DEFAULT_CREDS[0]))
-
 static void check_default_creds(const char *target) {
     lantern_section("DEFAULT CREDENTIALS");
 
-    /* Test HTTP Basic Auth against common paths */
+    /* Test HTTP Basic Auth against common paths.
+       First fetch each path WITHOUT auth — only test credentials if the
+       endpoint returns 401/403 (RFC 7235 Basic Auth challenge).  Routers
+       that use form-based login return 200 regardless of Basic Auth
+       headers, which caused false-positive CRITICAL findings. */
     static const char *paths[] = { "/", "/status", "/admin", "/management" };
     int path_count = sizeof(paths) / sizeof(paths[0]);
 
     char buf[4096];
-    int tested = 0, found = 0;
+    int tested = 0, found = 0, any_auth_required = 0;
 
     for (int p = 0; p < path_count && !found; p++) {
-        for (int c = 0; c < (int)CRED_COUNT; c++) {
+        /* Baseline: fetch without credentials */
+        int bn = lantern_http_get(target, 80, paths[p], NULL, buf, sizeof(buf));
+        if (bn <= 0) continue;
+
+        int baseline = lantern_http_status(buf);
+        if (baseline != 401 && baseline != 403) continue;
+
+        /* This path requires authentication — test credentials */
+        any_auth_required = 1;
+        for (int c = 0; c < (int)LANTERN_CRED_COUNT; c++) {
             int n = lantern_http_get_auth(target, 80, paths[p],
-                                          DEFAULT_CREDS[c].user, DEFAULT_CREDS[c].pass,
+                                          LANTERN_DEFAULT_CREDS[c].user, LANTERN_DEFAULT_CREDS[c].pass,
                                           buf, sizeof(buf));
             tested++;
             if (n <= 0) continue;
 
             int status = lantern_http_status(buf);
-            if (status == 200) {
-                /* Check it's not just the login page again */
-                if (!lantern_body_contains_ci(buf, "password") ||
-                    lantern_body_contains_ci(buf, "dashboard") ||
-                    lantern_body_contains_ci(buf, "status") ||
-                    lantern_body_contains_ci(buf, "firmware") ||
-                    lantern_body_contains_ci(buf, "settings")) {
-                    printf("  " C_RED "CRITICAL" C_RESET " Default credentials work: "
-                           C_RED C_BOLD "%s/%s" C_RESET " on %s%s\n",
-                           DEFAULT_CREDS[c].user, DEFAULT_CREDS[c].pass,
-                           target, paths[p]);
-                    found = 1;
-                    break;
-                }
+            if (status == 200 || status == 301 || status == 302) {
+                printf("  " C_RED "CRITICAL" C_RESET " Default credentials work: "
+                       C_RED C_BOLD "%s/%s" C_RESET " on %s%s\n",
+                       LANTERN_DEFAULT_CREDS[c].user, LANTERN_DEFAULT_CREDS[c].pass,
+                       target, paths[p]);
+                found = 1;
+                break;
             }
         }
     }
 
-    if (!found) {
+    if (!found && any_auth_required) {
         printf("  " C_GREEN "OK      " C_RESET " Tested %d credential pairs — none worked\n", tested);
+    } else if (!found) {
+        printf("  " C_CYAN "INFO    " C_RESET " Router does not use HTTP Basic Auth (form-based login)\n");
+        printf("           " C_DIM "Test credentials manually via the admin panel" C_RESET "\n");
     }
 
     /* Test SSH if port 22 is open */
@@ -339,27 +328,29 @@ static void check_services(const char *target) {
         const char *name;
         const char *risk;
         int         severity;
+        int         is_udp;    /* 1 = UDP check (SNMP), 0 = TCP */
     } checks[] = {
-        {22,   "SSH",       "Remote shell access — ensure key-based auth",      SVC_SEVERITY_WARN},
-        {23,   "Telnet",    "Plaintext remote shell — DISABLE IMMEDIATELY",     SVC_SEVERITY_CRIT},
-        {80,   "HTTP",      "Unencrypted admin panel",                          SVC_SEVERITY_WARN},
-        {443,  "HTTPS",     "Encrypted admin panel (good)",                     SVC_SEVERITY_OK},
-        {5000, "SSDP",      "UPnP/SSDP service",                               SVC_SEVERITY_WARN},
-        {8080, "HTTP-Alt",  "Alternate HTTP — may be management interface",     SVC_SEVERITY_WARN},
-        {8443, "HTTPS-Mgmt","HTTPS management",                                SVC_SEVERITY_OK},
-        {53,   "DNS",       "DNS resolver",                                     SVC_SEVERITY_OK},
-        {161,  "SNMP",      "Network management — often default community string", SVC_SEVERITY_CRIT},
+        {22,   "SSH",       "Remote shell access — ensure key-based auth",      SVC_SEVERITY_WARN, 0},
+        {23,   "Telnet",    "Plaintext remote shell — DISABLE IMMEDIATELY",     SVC_SEVERITY_CRIT, 0},
+        {80,   "HTTP",      "Unencrypted admin panel",                          SVC_SEVERITY_WARN, 0},
+        {443,  "HTTPS",     "Encrypted admin panel (good)",                     SVC_SEVERITY_OK,   0},
+        {5000, "SSDP",      "UPnP/SSDP service",                               SVC_SEVERITY_WARN, 0},
+        {8080, "HTTP-Alt",  "Alternate HTTP — may be management interface",     SVC_SEVERITY_WARN, 0},
+        {8443, "HTTPS-Mgmt","HTTPS management",                                SVC_SEVERITY_OK,   0},
+        {53,   "DNS",       "DNS resolver",                                     SVC_SEVERITY_OK,   0},
+        {161,  "SNMP",      "Network management — often default community string", SVC_SEVERITY_CRIT, 1},
     };
     int check_count = sizeof(checks) / sizeof(checks[0]);
     int open_flags[sizeof(checks) / sizeof(checks[0])];
     memset(open_flags, 0, sizeof(open_flags));
 
-    /* Parallel TCP checks */
+    /* Parallel TCP checks (skip UDP entries — handled below) */
     SvcCheckArg args[sizeof(checks) / sizeof(checks[0])];
     HANDLE threads[sizeof(checks) / sizeof(checks[0])];
     DWORD tc = 0;
 
     for (int i = 0; i < check_count; i++) {
+        if (checks[i].is_udp) continue;
         args[i].host = target;
         args[i].port = checks[i].port;
         args[i].flag = &open_flags[i];
@@ -367,6 +358,12 @@ static void check_services(const char *target) {
         if (h) threads[tc++] = h;
     }
     if (tc > 0) lantern_wait_threads(threads, tc, 3000);
+
+    /* SNMP (UDP) probe */
+    for (int i = 0; i < check_count; i++) {
+        if (checks[i].is_udp && checks[i].port == 161)
+            open_flags[i] = lantern_snmp_probe(target, 2000);
+    }
 
     int open_count = 0;
     for (int i = 0; i < check_count; i++) {
@@ -390,6 +387,15 @@ static void check_services(const char *target) {
 /* ── Main ─────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    if (lantern_check_flags(argc, argv, "routercheck",
+            "test your router for misconfigurations",
+            "Usage: routercheck [ip] [--help] [--version]\n"
+            "\n"
+            "Probes your gateway for common security issues: open admin panels,\n"
+            "default credentials, UPnP exposure, SSH, DNS, and dangerous services.\n"
+            "Auto-detects gateway if no IP is given."))
+        return 0;
+
     lantern_init();
 
     WSADATA wsa;
@@ -401,7 +407,7 @@ int main(int argc, char **argv) {
     lantern_banner("routercheck", "test your router for misconfigurations");
 
     char target[64];
-    if (argc >= 2) {
+    if (argc >= 2 && argv[1][0] != '-') {
         snprintf(target, sizeof(target), "%s", argv[1]);
     } else {
         if (!lantern_get_gateway(target, sizeof(target))) {

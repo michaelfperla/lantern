@@ -6,6 +6,10 @@
 #ifndef LANTERN_H
 #define LANTERN_H
 
+#ifndef _WIN32
+#error "Lantern requires Windows (WinSock2, IP Helper, WLAN API)"
+#endif
+
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0600
 
@@ -17,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 
 /* ── MinGW compat ────────────────────────────────────────────────── */
 
@@ -27,6 +32,10 @@
 #ifndef ERROR_SERVICE_NOT_RUNNING
 #define ERROR_SERVICE_NOT_RUNNING 2186L
 #endif
+
+/* ── Version ───────────────────────────────────────────────────────── */
+
+#define LANTERN_VERSION "1.1.0"
 
 /* ── ANSI color macros ───────────────────────────────────────────── */
 
@@ -228,6 +237,26 @@ static void lantern_section(const char *title) {
     printf(C_BOLD C_YELLOW "\n  ═══ %s ═══\n\n" C_RESET, title);
 }
 
+/* Check argv for --help/-h/--version/-v.  Returns 1 if handled (caller
+   should exit 0), 0 if no flag matched. */
+static int lantern_check_flags(int argc, char **argv,
+                                const char *tool, const char *desc,
+                                const char *extra_usage) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("lantern %s %s\n", tool, LANTERN_VERSION);
+            return 1;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("lantern %s %s — %s\n\n", tool, LANTERN_VERSION, desc);
+            if (extra_usage)
+                printf("%s\n", extra_usage);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Fetch adapter list. Caller must free() the returned pointer. */
 static IP_ADAPTER_INFO *lantern_get_adapters(void) {
     ULONG buflen = sizeof(IP_ADAPTER_INFO);
@@ -323,11 +352,13 @@ static int lantern_tcp_open(const char *ip, uint16_t port, int timeout_ms) {
     lantern_fill_sockaddr(&addr, ip, port);
     connect(s, (struct sockaddr *)&addr, sizeof(addr));
 
-    fd_set wset;
+    fd_set wset, eset;
     FD_ZERO(&wset); FD_SET(s, &wset);
+    FD_ZERO(&eset); FD_SET(s, &eset);
     struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
     int open = 0;
-    if (select(0, NULL, &wset, NULL, &tv) > 0) {
+    if (select(0, NULL, &wset, &eset, &tv) > 0 &&
+        FD_ISSET(s, &wset) && !FD_ISSET(s, &eset)) {
         int err = 0; int errlen = sizeof(err);
         getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
         if (err == 0) open = 1;
@@ -464,8 +495,353 @@ static const char *lantern_security_from_ies(const uint8_t *ies, ULONG ie_len) {
     return has_wpa ? "WPA" : "Open";
 }
 
+/* ── ARP scan (shared by netscan, netwatch, netreport) ─────────────── */
+
+#define LANTERN_MAX_HOSTS 254
+
+typedef struct {
+    uint32_t ip;
+    uint8_t  mac[6];
+} LanternHost;
+
+typedef struct {
+    uint32_t       target_ip;
+    LanternHost   *results;
+    volatile LONG *found;
+} LanternArpArg;
+
+static DWORD WINAPI lantern_arp_thread(LPVOID param) {
+    LanternArpArg *arg = (LanternArpArg *)param;
+    ULONG mac[2];
+    ULONG mac_len = 6;
+    if (SendARP(arg->target_ip, 0, mac, &mac_len) == NO_ERROR && mac_len > 0) {
+        LONG idx = InterlockedIncrement(arg->found) - 1;
+        if (idx < LANTERN_MAX_HOSTS) {
+            arg->results[idx].ip = arg->target_ip;
+            memcpy(arg->results[idx].mac, (uint8_t *)mac, 6);
+        }
+    }
+    free(arg);
+    return 0;
+}
+
+static int lantern_cmp_host(const void *a, const void *b) {
+    uint32_t ia = ntohl(((const LanternHost *)a)->ip);
+    uint32_t ib = ntohl(((const LanternHost *)b)->ip);
+    return (ia > ib) - (ia < ib);
+}
+
+/* ARP-scan a network.  Fills results[] (caller-provided, LANTERN_MAX_HOSTS).
+   Returns number of live hosts found (sorted by IP). */
+static int lantern_arp_scan(uint32_t network, uint32_t mask,
+                            LanternHost *results, DWORD timeout_ms) {
+    uint32_t net_hbo  = ntohl(network);
+    uint32_t mask_hbo = ntohl(mask);
+    uint32_t num      = (~mask_hbo) - 1;
+    if (num > LANTERN_MAX_HOSTS) num = LANTERN_MAX_HOSTS;
+
+    volatile LONG found = 0;
+    memset(results, 0, sizeof(LanternHost) * LANTERN_MAX_HOSTS);
+
+    HANDLE threads[LANTERN_MAX_HOSTS];
+    DWORD  tc = 0;
+
+    for (uint32_t i = 1; i <= num; i++) {
+        LanternArpArg *arg = (LanternArpArg *)malloc(sizeof(LanternArpArg));
+        if (!arg) continue;
+        arg->target_ip = htonl(net_hbo + i);
+        arg->results   = results;
+        arg->found     = &found;
+        HANDLE h = CreateThread(NULL, 0, lantern_arp_thread, arg, 0, NULL);
+        if (h) threads[tc++] = h; else free(arg);
+    }
+    if (tc > 0) lantern_wait_threads(threads, tc, timeout_ms);
+
+    LONG n = found;
+    if (n > LANTERN_MAX_HOSTS) n = LANTERN_MAX_HOSTS;
+    qsort(results, (size_t)n, sizeof(LanternHost), lantern_cmp_host);
+    return (int)n;
+}
+
+/* ── SNMP probe (UDP) ─────────────────────────────────────────────── */
+
+/* Send an SNMP v1 GetRequest for sysDescr.0 and check for a response.
+   Returns 1 if SNMP agent responded, 0 otherwise. */
+static int lantern_snmp_probe(const char *host, int timeout_ms) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
+
+    struct sockaddr_in addr;
+    lantern_fill_sockaddr(&addr, host, 161);
+    DWORD t = (DWORD)timeout_ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t));
+
+    /* SNMP v1 GetRequest for sysDescr.0 (1.3.6.1.2.1.1.1.0)
+       community string: "public" */
+    static const uint8_t snmp_get[] = {
+        0x30, 0x29,                         /* SEQUENCE len=41 */
+        0x02, 0x01, 0x00,                   /* version: v1 (0) */
+        0x04, 0x06, 'p','u','b','l','i','c',/* community: "public" */
+        0xa0, 0x1c,                         /* GetRequest-PDU len=28 */
+        0x02, 0x04, 0x00,0x00,0x00,0x01,    /* request-id: 1 */
+        0x02, 0x01, 0x00,                   /* error-status: 0 */
+        0x02, 0x01, 0x00,                   /* error-index: 0 */
+        0x30, 0x0e,                         /* varbind list */
+        0x30, 0x0c,                         /* varbind */
+        0x06, 0x08, 0x2b,0x06,0x01,0x02,0x01,0x01,0x01,0x00, /* OID */
+        0x05, 0x00,                         /* NULL value */
+    };
+
+    sendto(s, (const char *)snmp_get, sizeof(snmp_get), 0,
+           (struct sockaddr *)&addr, sizeof(addr));
+
+    char buf[512];
+    struct sockaddr_in from;
+    int fromlen = sizeof(from);
+    int n = recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fromlen);
+    closesocket(s);
+    return (n > 0) ? 1 : 0;
+}
+
+/* ── Bounded thread pool ───────────────────────────────────────────── */
+
+/* Run `count` work items through `fn`, with at most `max_concurrent`
+   threads active at once.  `args` is an array of pointers passed to fn.
+   Each thread receives one arg. */
+static void lantern_run_bounded(LPTHREAD_START_ROUTINE fn,
+                                void **args, int count,
+                                int max_concurrent, DWORD timeout_ms) {
+    HANDLE *active = (HANDLE *)malloc(sizeof(HANDLE) * (size_t)max_concurrent);
+    if (!active) return;
+    int running = 0, next = 0;
+
+    while (next < count || running > 0) {
+        /* Fill up to max_concurrent */
+        while (running < max_concurrent && next < count) {
+            HANDLE h = CreateThread(NULL, 0, fn, args[next], 0, NULL);
+            if (h) {
+                active[running++] = h;
+            }
+            next++;
+        }
+        if (running == 0) break;
+
+        /* Wait for any one thread to finish */
+        DWORD idx = WaitForMultipleObjects((DWORD)running, active,
+                                           FALSE, timeout_ms);
+        if (idx < WAIT_OBJECT_0 + (DWORD)running) {
+            DWORD done = idx - WAIT_OBJECT_0;
+            CloseHandle(active[done]);
+            /* Compact: move last into the vacated slot */
+            active[done] = active[--running];
+        } else {
+            /* Timeout or error — close all remaining */
+            for (int i = 0; i < running; i++)
+                CloseHandle(active[i]);
+            running = 0;
+        }
+    }
+    free(active);
+}
+
+/* ── ARRIS CMAC OUI table (shared by keygen + wificrack) ──────────── */
+
+static const uint8_t LANTERN_ARRIS_OUIS[][3] = {
+    {0x8C, 0x61, 0xA3},   /* Confirmed on TG2482A (IZZI Mexico) */
+    {0xE8, 0xED, 0x05},   /* ARRIS Group                        */
+    {0x00, 0x1D, 0xCE},   /* ARRIS International                */
+    {0x00, 0x15, 0x96},   /* ARRIS Interactive                  */
+    {0x20, 0x3D, 0x66},   /* ARRIS Group                        */
+};
+#define LANTERN_ARRIS_OUI_COUNT (sizeof(LANTERN_ARRIS_OUIS) / sizeof(LANTERN_ARRIS_OUIS[0]))
+
+/* Build ARRIS CMAC password: OUI + unknown_byte + suffix → 12-char hex string.
+   Caller must provide a buffer of at least 13 bytes. */
+static void lantern_arris_password(const uint8_t oui[3], int unknown_byte,
+                                    const uint8_t suffix[2],
+                                    char *out, size_t outlen) {
+    snprintf(out, outlen, "%02X%02X%02X%02X%02X%02X",
+             oui[0], oui[1], oui[2],
+             (uint8_t)unknown_byte, suffix[0], suffix[1]);
+}
+
+/* Extract 4-char hex suffix from SSID like "IZZI-1F56" or "ARRIS-1F56-5G".
+   Returns 1 on success and fills suffix_bytes[2]. */
+static int lantern_parse_arris_suffix(const char *input, uint8_t suffix_bytes[2]) {
+    const char *hex = NULL;
+    const char *dash = strrchr(input, '-');
+
+    if (dash) {
+        if (_stricmp(dash + 1, "5G") == 0) {
+            /* Strip -5G suffix, find the real suffix dash */
+            char copy[64];
+            size_t len = (size_t)(dash - input);
+            if (len >= sizeof(copy)) return 0;
+            memcpy(copy, input, len);
+            copy[len] = '\0';
+            const char *prev = strrchr(copy, '-');
+            if (prev && strlen(prev + 1) == 4)
+                hex = input + (prev + 1 - copy);
+        } else if (strlen(dash + 1) == 4) {
+            hex = dash + 1;
+        }
+    }
+
+    if (!hex && strlen(input) == 4)
+        hex = input;
+    if (!hex) return 0;
+
+    for (int i = 0; i < 4; i++)
+        if (!isxdigit((unsigned char)hex[i])) return 0;
+
+    unsigned int b0, b1;
+    if (sscanf(hex, "%2x%2x", &b0, &b1) != 2) return 0;
+    suffix_bytes[0] = (uint8_t)b0;
+    suffix_bytes[1] = (uint8_t)b1;
+    return 1;
+}
+
+/* ARRIS WiFi target for scan results */
+typedef struct {
+    char ssid[33];
+    char bssid[20];
+    long rssi;
+    uint8_t suffix[2];
+} LanternArrisTarget;
+
+/* ── Default credentials for router testing ──────────────────────── */
+
+typedef struct {
+    const char *user;
+    const char *pass;
+} LanternCredential;
+
+static const LanternCredential LANTERN_DEFAULT_CREDS[] = {
+    {"admin", "admin"},    {"admin", "password"}, {"admin", "1234"},
+    {"admin", "12345"},    {"admin", ""},          {"root",  "root"},
+    {"root",  "admin"},    {"root",  ""},          {"user",  "user"},
+    {"admin", "Admin"},
+};
+#define LANTERN_CRED_COUNT (sizeof(LANTERN_DEFAULT_CREDS) / sizeof(LANTERN_DEFAULT_CREDS[0]))
+
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
 
 #endif /* LANTERN_H */
+
+/* ── WLAN extension (include wlanapi.h BEFORE lantern.h to activate) ── */
+
+#if defined(_INC_WLANAPI) && !defined(LANTERN_WLAN_IMPL_DEFINED)
+#define LANTERN_WLAN_IMPL_DEFINED
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+
+/* Event-driven WiFi scan wait.  Calls WlanScan and waits for the scan
+   complete notification instead of a fixed Sleep(2000).  Falls back to
+   2s sleep if the notification doesn't arrive within timeout_ms. */
+static HANDLE g_lantern_scan_event = NULL;
+
+static void WINAPI lantern_scan_notify(PWLAN_NOTIFICATION_DATA data, PVOID ctx) {
+    (void)ctx;
+    if (data->NotificationSource == WLAN_NOTIFICATION_SOURCE_ACM &&
+        data->NotificationCode == 7 /* scan_complete */) {
+        if (g_lantern_scan_event)
+            SetEvent(g_lantern_scan_event);
+    }
+}
+
+static void lantern_wlan_scan_wait(HANDLE wlan, GUID *guid, DWORD timeout_ms) {
+    g_lantern_scan_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_lantern_scan_event) {
+        /* Fallback */
+        WlanScan(wlan, guid, NULL, NULL, NULL);
+        Sleep(timeout_ms);
+        return;
+    }
+
+    DWORD prev = 0;
+    WlanRegisterNotification(wlan, WLAN_NOTIFICATION_SOURCE_ACM, TRUE,
+                             (WLAN_NOTIFICATION_CALLBACK)lantern_scan_notify,
+                             NULL, NULL, &prev);
+
+    WlanScan(wlan, guid, NULL, NULL, NULL);
+    WaitForSingleObject(g_lantern_scan_event, timeout_ms);
+
+    /* Unregister notification */
+    WlanRegisterNotification(wlan, WLAN_NOTIFICATION_SOURCE_NONE, TRUE,
+                             NULL, NULL, NULL, &prev);
+
+    CloseHandle(g_lantern_scan_event);
+    g_lantern_scan_event = NULL;
+}
+
+/* Scan for ARRIS/IZZI WiFi networks.  Returns number of targets found.
+   Triggers a WiFi scan, waits 2s, filters by IZZI-/ARRIS- prefix,
+   deduplicates by suffix (keeps strongest signal). */
+static int lantern_scan_arris_targets(LanternArrisTarget *targets, int max,
+                                      HANDLE wlan, GUID *guid) {
+    int count = 0;
+
+    printf(C_DIM "  Scanning for ARRIS/IZZI networks..." C_RESET);
+    fflush(stdout);
+    lantern_wlan_scan_wait(wlan, guid, 3000);
+    printf("\r                                       \r");
+
+    PWLAN_BSS_LIST bl = NULL;
+    WlanGetNetworkBssList(wlan, guid, NULL, dot11_BSS_type_any,
+                          FALSE, NULL, &bl);
+    if (!bl) return 0;
+
+    for (DWORD i = 0; i < bl->dwNumberOfItems && count < max; i++) {
+        WLAN_BSS_ENTRY *b = &bl->wlanBssEntries[i];
+        char ssid[33] = {0};
+        ULONG sl = b->dot11Ssid.uSSIDLength;
+        if (sl > 32) sl = 32;
+        memcpy(ssid, b->dot11Ssid.ucSSID, sl);
+
+        uint8_t suffix[2];
+        if (!lantern_parse_arris_suffix(ssid, suffix)) continue;
+
+        int is_target = (_strnicmp(ssid, "IZZI-", 5) == 0 ||
+                         _strnicmp(ssid, "ARRIS-", 6) == 0);
+        if (!is_target) continue;
+
+        /* Deduplicate by suffix — keep stronger signal */
+        int dup = 0;
+        for (int j = 0; j < count; j++) {
+            if (targets[j].suffix[0] == suffix[0] &&
+                targets[j].suffix[1] == suffix[1]) {
+                if (b->lRssi > targets[j].rssi) {
+                    memcpy(targets[j].ssid, ssid, sizeof(ssid));
+                    lantern_format_mac(b->dot11Bssid, targets[j].bssid,
+                                       sizeof(targets[j].bssid));
+                    targets[j].rssi = b->lRssi;
+                }
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) continue;
+
+        memcpy(targets[count].ssid, ssid, sizeof(ssid));
+        lantern_format_mac(b->dot11Bssid, targets[count].bssid,
+                           sizeof(targets[count].bssid));
+        targets[count].rssi = b->lRssi;
+        targets[count].suffix[0] = suffix[0];
+        targets[count].suffix[1] = suffix[1];
+        count++;
+    }
+
+    WlanFreeMemory(bl);
+    return count;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+#endif /* _INC_WLANAPI && !LANTERN_WLAN_IMPL_DEFINED */

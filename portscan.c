@@ -62,6 +62,31 @@ static const PortInfo PORTS[] = {
 
 #define PORT_COUNT (sizeof(PORTS) / sizeof(PORTS[0]))
 
+/* ── User port filter ─────────────────────────────────────────────── */
+
+static uint16_t g_user_ports[256];
+static int      g_user_port_count = 0;
+
+/* Parse comma-separated port list like "22,80,443" */
+static void parse_port_list(const char *s) {
+    while (*s) {
+        uint16_t p = (uint16_t)atoi(s);
+        if (p > 0 && g_user_port_count < 256)
+            g_user_ports[g_user_port_count++] = p;
+        const char *comma = strchr(s, ',');
+        if (!comma) break;
+        s = comma + 1;
+    }
+}
+
+/* Check if port is in user filter (0 = no filter, scan all) */
+static int port_in_filter(uint16_t port) {
+    if (g_user_port_count == 0) return 1;
+    for (int i = 0; i < g_user_port_count; i++)
+        if (g_user_ports[i] == port) return 1;
+    return 0;
+}
+
 /* ── Threaded port scan ──────────────────────────────────────────── */
 
 typedef struct {
@@ -74,37 +99,7 @@ static PortThreadArg g_port_results[PORT_COUNT];
 
 static DWORD WINAPI port_thread(LPVOID param) {
     PortThreadArg *arg = (PortThreadArg *)param;
-
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        arg->open = 0;
-        return 0;
-    }
-
-    u_long nonblock = 1;
-    ioctlsocket(s, FIONBIO, &nonblock);
-
-    struct sockaddr_in addr;
-    lantern_fill_sockaddr(&addr, arg->target, arg->port);
-
-    connect(s, (struct sockaddr *)&addr, sizeof(addr));
-
-    fd_set wset, eset;
-    FD_ZERO(&wset); FD_SET(s, &wset);
-    FD_ZERO(&eset); FD_SET(s, &eset);
-    struct timeval tv = {1, 500000};
-
-    int sel = select(0, NULL, &wset, &eset, &tv);
-    if (sel > 0 && FD_ISSET(s, &wset) && !FD_ISSET(s, &eset)) {
-        int err = 0;
-        int errlen = sizeof(err);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
-        arg->open = (err == 0) ? 1 : 0;
-    } else {
-        arg->open = 0;
-    }
-
-    closesocket(s);
+    arg->open = lantern_tcp_open(arg->target, arg->port, 1500);
     return 0;
 }
 
@@ -193,6 +188,8 @@ static void scan_ports(const char *target) {
         g_port_results[i].port   = PORTS[i].port;
         g_port_results[i].open   = 0;
 
+        if (!port_in_filter(PORTS[i].port)) continue;
+
         HANDLE h = CreateThread(NULL, 0, port_thread, &g_port_results[i], 0, NULL);
         if (h)
             threads[thread_count++] = h;
@@ -256,6 +253,16 @@ static void scan_ports(const char *target) {
 /* ── Main ─────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    if (lantern_check_flags(argc, argv, "portscan",
+            "scan a host for open TCP ports",
+            "Usage: portscan [options] <ip>\n"
+            "\n"
+            "Options:\n"
+            "  -p <ports>   Comma-separated port list (e.g. -p 22,80,443)\n"
+            "  -h, --help   Show this help\n"
+            "  -v, --version  Show version"))
+        return 0;
+
     lantern_init();
 
     WSADATA wsa;
@@ -264,16 +271,26 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Parse -p flag */
+    const char *target = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+            parse_port_list(argv[++i]);
+        } else if (argv[i][0] != '-') {
+            target = argv[i];
+        }
+    }
+
     lantern_banner("portscan", "scan a host for open TCP ports");
 
-    if (argc < 2) {
+    if (!target) {
         printf("  " C_RED "Usage:" C_RESET " portscan <ip>\n");
         printf("  " C_DIM "Example: portscan 192.168.0.1" C_RESET "\n\n");
         WSACleanup();
         return 1;
     }
 
-    scan_ports(argv[1]);
+    scan_ports(target);
 
     printf("\n");
     WSACleanup();

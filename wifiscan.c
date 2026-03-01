@@ -8,6 +8,7 @@
 
 #include "lantern.h"
 #include <wlanapi.h>
+#include "lantern.h"  /* re-include to activate WLAN extension */
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -85,21 +86,10 @@ static void scan_wifi(void) {
     printf("  Interface: " C_CYAN "%ls" C_RESET "\n",
            iface_list->InterfaceInfo[0].strInterfaceDescription);
 
-    /* Trigger scan */
-    ret = WlanScan(wlan_handle, iface_guid, NULL, NULL, NULL);
-    if (ret == ERROR_ACCESS_DENIED) {
-        printf(C_RED "\n  [!] WiFi scan denied — location permission required.\n" C_RESET);
-        printf(C_DIM "      Settings > Privacy & Security > Location > allow for apps.\n" C_RESET);
-        goto cleanup;
-    }
-    if (ret != ERROR_SUCCESS) {
-        printf(C_RED "  [!] WlanScan failed: %lu\n" C_RESET, ret);
-        goto cleanup;
-    }
-
+    /* Trigger scan with event-driven wait */
     printf(C_DIM "  Waiting for scan results..." C_RESET);
     fflush(stdout);
-    Sleep(2000);
+    lantern_wlan_scan_wait(wlan_handle, iface_guid, 3000);
     printf("\r                                \r");
 
     /* BSS list (per-AP: BSSID, RSSI, frequency) */
@@ -169,7 +159,14 @@ cleanup:
 
 /* ── Main ─────────────────────────────────────────────────────────── */
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (lantern_check_flags(argc, argv, "wifiscan",
+            "enumerate nearby WiFi networks",
+            "Usage: wifiscan [--help] [--version]\n"
+            "\n"
+            "Lists all visible access points with signal, channel, band, and security."))
+        return 0;
+
     lantern_init();
 
     lantern_banner("wifiscan", "enumerate nearby WiFi networks");

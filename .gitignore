@@ -6,3 +6,6 @@
 *.exp
 *.lib
 audit-report.md
+audit-*.md
+HARDENING.md
+.playwright-mcp/

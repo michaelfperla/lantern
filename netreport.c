@@ -12,6 +12,7 @@
 
 #include "lantern.h"
 #include <wlanapi.h>
+#include "lantern.h"  /* re-include to activate WLAN extension */
 #include <time.h>
 
 /* ── Report output ───────────────────────────────────────────────── */
@@ -33,60 +34,9 @@ static void finding(const char *severity, const char *msg) {
     rprintf("| **%s** | %s |\n", severity, msg);
 }
 
-/* ── ARP scan (inline) ───────────────────────────────────────────── */
+/* ── ARP scan (shared via lantern.h) ─────────────────────────────── */
 
-typedef struct { uint32_t ip; uint8_t mac[6]; } Host;
-
-#define MAX_HOSTS 254
-static Host          g_hosts[MAX_HOSTS];
-static volatile LONG g_found = 0;
-
-typedef struct { uint32_t target_ip; } ArpArg;
-
-static DWORD WINAPI arp_thread(LPVOID param) {
-    ArpArg *arg = (ArpArg *)param;
-    ULONG mac[2]; ULONG mac_len = 6;
-    if (SendARP(arg->target_ip, 0, mac, &mac_len) == NO_ERROR && mac_len > 0) {
-        LONG idx = InterlockedIncrement(&g_found) - 1;
-        if (idx < MAX_HOSTS) {
-            g_hosts[idx].ip = arg->target_ip;
-            memcpy(g_hosts[idx].mac, (uint8_t *)mac, 6);
-        }
-    }
-    free(arg);
-    return 0;
-}
-
-static int cmp_host(const void *a, const void *b) {
-    uint32_t ia = ntohl(((const Host *)a)->ip);
-    uint32_t ib = ntohl(((const Host *)b)->ip);
-    return (ia > ib) - (ia < ib);
-}
-
-static int scan_hosts(uint32_t network, uint32_t mask) {
-    uint32_t net_hbo = ntohl(network), mask_hbo = ntohl(mask);
-    uint32_t num = (~mask_hbo) - 1;
-    if (num > MAX_HOSTS) num = MAX_HOSTS;
-
-    HANDLE threads[MAX_HOSTS];
-    DWORD tc = 0;
-    g_found = 0;
-    memset(g_hosts, 0, sizeof(g_hosts));
-
-    for (uint32_t i = 1; i <= num; i++) {
-        ArpArg *arg = (ArpArg *)malloc(sizeof(ArpArg));
-        if (!arg) continue;
-        arg->target_ip = htonl(net_hbo + i);
-        HANDLE h = CreateThread(NULL, 0, arp_thread, arg, 0, NULL);
-        if (h) threads[tc++] = h; else free(arg);
-    }
-    if (tc > 0) lantern_wait_threads(threads, tc, 5000);
-
-    LONG found = g_found;
-    if (found > MAX_HOSTS) found = MAX_HOSTS;
-    qsort(g_hosts, (size_t)found, sizeof(Host), cmp_host);
-    return (int)found;
-}
+static LanternHost g_hosts[LANTERN_MAX_HOSTS];
 
 /* ── Threaded port scan ──────────────────────────────────────────── */
 
@@ -107,7 +57,7 @@ typedef struct {
 } PortCheckArg;
 
 /* Flat bitmap: g_port_open[host_idx * NPORTS + port_idx] */
-static int g_port_open[MAX_HOSTS * NPORTS];
+static int g_port_open[LANTERN_MAX_HOSTS * NPORTS];
 
 static DWORD WINAPI port_check_thread(LPVOID param) {
     PortCheckArg *arg = (PortCheckArg *)param;
@@ -146,19 +96,20 @@ static int check_upnp_enabled(const char *target) {
     return (n > 0) ? 1 : 0;
 }
 
-/* ── Default credentials list (shared with routercheck) ──────────── */
-
-static const struct { const char *user; const char *pass; } DEFAULT_CREDS[] = {
-    {"admin", "admin"},   {"admin", "password"}, {"admin", "1234"},
-    {"admin", "12345"},   {"admin", ""},          {"root",  "root"},
-    {"root",  "admin"},   {"root",  ""},          {"user",  "user"},
-    {"admin", "Admin"},
-};
-#define CRED_COUNT (sizeof(DEFAULT_CREDS) / sizeof(DEFAULT_CREDS[0]))
-
 /* ── Main ─────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
+    if (lantern_check_flags(argc, argv, "netreport",
+            "generate a full network audit report",
+            "Usage: netreport [-o file.md] [--help] [--version]\n"
+            "\n"
+            "Runs all scans (device discovery, port scanning, router security,\n"
+            "WiFi enumeration) and produces a Markdown audit report.\n"
+            "\n"
+            "Options:\n"
+            "  -o <file>    Save report to file (default: stdout)"))
+        return 0;
+
     lantern_init();
 
     WSADATA wsa;
@@ -243,7 +194,7 @@ int main(int argc, char **argv) {
 
     rprintf("## Device Inventory\n\n");
 
-    int host_count = scan_hosts(network, mask);
+    int host_count = lantern_arp_scan(network, mask, g_hosts, 5000);
 
     rprintf("| IP Address | MAC Address | Vendor |\n");
     rprintf("|------------|-------------|--------|\n");
@@ -263,10 +214,10 @@ int main(int argc, char **argv) {
 
     memset(g_port_open, 0, sizeof(g_port_open));
 
-    /* Launch one thread per (host, port) pair */
+    /* Build work items, run with bounded concurrency (max 64 threads) */
     int total_checks = host_count * (int)NPORTS;
-    HANDLE *pt = (HANDLE *)malloc(sizeof(HANDLE) * (size_t)total_checks);
-    DWORD ptc = 0;
+    void **work = (void **)malloc(sizeof(void *) * (size_t)total_checks);
+    int wi = 0;
 
     for (int h = 0; h < host_count; h++) {
         for (int p = 0; p < (int)NPORTS; p++) {
@@ -275,12 +226,11 @@ int main(int argc, char **argv) {
             arg->host_idx = h;
             arg->port_idx = p;
             arg->host_ip  = g_hosts[h].ip;
-            HANDLE th = CreateThread(NULL, 0, port_check_thread, arg, 0, NULL);
-            if (th) pt[ptc++] = th; else free(arg);
+            work[wi++] = arg;
         }
     }
-    if (ptc > 0) lantern_wait_threads(pt, ptc, 10000);
-    free(pt);
+    if (wi > 0) lantern_run_bounded(port_check_thread, work, wi, 64, 10000);
+    free(work);
 
     rprintf("| Device | Port | Service | Note |\n");
     rprintf("|--------|------|---------|------|\n");
@@ -329,28 +279,34 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Default creds — test full list */
+    /* Default creds — test paths that return 401/403 (HTTP Basic Auth).
+       Skip form-based login (200) to avoid false positives. */
     {
+        static const char *cred_paths[] = { "/", "/status", "/admin", "/management" };
         char buf[4096];
         int cred_found = 0;
-        for (int c = 0; c < (int)CRED_COUNT && !cred_found; c++) {
-            int n = lantern_http_get_auth(gateway, 80, "/",
-                                          DEFAULT_CREDS[c].user, DEFAULT_CREDS[c].pass,
-                                          buf, sizeof(buf));
+        for (int p = 0; p < 4 && !cred_found; p++) {
+            int n = lantern_http_get(gateway, 80, cred_paths[p], NULL, buf, sizeof(buf));
             if (n <= 0) continue;
-            int status = lantern_http_status(buf);
-            if (status == 200 &&
-                (!lantern_body_contains_ci(buf, "password") ||
-                 lantern_body_contains_ci(buf, "dashboard") ||
-                 lantern_body_contains_ci(buf, "status") ||
-                 lantern_body_contains_ci(buf, "firmware") ||
-                 lantern_body_contains_ci(buf, "settings"))) {
-                char msg[128];
-                snprintf(msg, sizeof(msg),
-                         "Default credentials **%s/%s** accepted",
-                         DEFAULT_CREDS[c].user, DEFAULT_CREDS[c].pass);
-                finding("CRITICAL", msg);
-                cred_found = 1;
+            int baseline = lantern_http_status(buf);
+            if (baseline != 401 && baseline != 403) continue;
+
+            for (int c = 0; c < (int)LANTERN_CRED_COUNT && !cred_found; c++) {
+                n = lantern_http_get_auth(gateway, 80, cred_paths[p],
+                                          LANTERN_DEFAULT_CREDS[c].user,
+                                          LANTERN_DEFAULT_CREDS[c].pass,
+                                          buf, sizeof(buf));
+                if (n <= 0) continue;
+                int status = lantern_http_status(buf);
+                if (status == 200 || status == 301 || status == 302) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "Default credentials **%s/%s** accepted",
+                             LANTERN_DEFAULT_CREDS[c].user,
+                             LANTERN_DEFAULT_CREDS[c].pass);
+                    finding("CRITICAL", msg);
+                    cred_found = 1;
+                }
             }
         }
     }
@@ -381,8 +337,7 @@ int main(int argc, char **argv) {
         WlanEnumInterfaces(wlan, NULL, &il);
         if (il && il->dwNumberOfItems > 0) {
             GUID *guid = &il->InterfaceInfo[0].InterfaceGuid;
-            WlanScan(wlan, guid, NULL, NULL, NULL);
-            Sleep(2000);
+            lantern_wlan_scan_wait(wlan, guid, 3000);
 
             PWLAN_BSS_LIST bl = NULL;
             WlanGetNetworkBssList(wlan, guid, NULL, dot11_BSS_type_any, FALSE, NULL, &bl);
@@ -432,12 +387,14 @@ int main(int argc, char **argv) {
     rprintf("| Info | %d |\n", g_info);
     rprintf("\n");
 
-    if (g_crit > 0) {
+    if (g_crit > 0 || g_warn > 0) {
         rprintf("### Recommended Actions\n\n");
-        rprintf("1. **Change router admin password immediately** — default credentials are a critical risk\n");
-        rprintf("2. **Disable UPnP** in router settings — prevents devices from opening external ports\n");
-        rprintf("3. **Disable SSH** on the router if not actively used\n");
-        rprintf("4. **Use HTTPS** for router admin access, not HTTP\n");
+        int action = 1;
+        if (g_crit > 0)
+            rprintf("%d. **Review critical findings above** and remediate immediately\n", action++);
+        rprintf("%d. **Disable UPnP** in router settings — prevents devices from opening external ports\n", action++);
+        rprintf("%d. **Disable SSH** on the router if not actively used\n", action++);
+        rprintf("%d. **Use HTTPS** for router admin access, not HTTP\n", action++);
         rprintf("\n");
     }
 
