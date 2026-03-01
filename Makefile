@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra
-TOOLS   = netscan.exe portscan.exe wifiscan.exe
+TOOLS   = netscan.exe portscan.exe wifiscan.exe netwatch.exe
 
 all: $(TOOLS)
 
@@ -12,6 +12,9 @@ portscan.exe: portscan.c lantern.h
 
 wifiscan.exe: wifiscan.c lantern.h
 	$(CC) $(CFLAGS) -o $@ wifiscan.c -lws2_32 -lwlanapi -lole32
+
+netwatch.exe: netwatch.c lantern.h
+	$(CC) $(CFLAGS) -o $@ netwatch.c -lws2_32 -liphlpapi
 
 clean:
 	rm -f $(TOOLS)
