@@ -295,6 +295,175 @@ static void lantern_ip_to_str(uint32_t addr_nbo, char *buf, size_t buflen) {
     InetNtopA(AF_INET, &a, buf, (size_t)buflen);
 }
 
+/* Get default gateway IP as string. Returns 1 on success, 0 on failure. */
+static int lantern_get_gateway(char *buf, size_t buflen) {
+    IP_ADAPTER_INFO *info = lantern_get_adapters();
+    if (!info) return 0;
+    for (IP_ADAPTER_INFO *a = info; a; a = a->Next) {
+        const char *gw = a->GatewayList.IpAddress.String;
+        if (strcmp(gw, "0.0.0.0") != 0 && strlen(gw) > 0) {
+            snprintf(buf, buflen, "%s", gw);
+            free(info);
+            return 1;
+        }
+    }
+    free(info);
+    return 0;
+}
+
+/* Non-blocking TCP port check. Returns 1 if port is open, 0 otherwise. */
+static int lantern_tcp_open(const char *ip, uint16_t port, int timeout_ms) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+
+    u_long nonblock = 1;
+    ioctlsocket(s, FIONBIO, &nonblock);
+
+    struct sockaddr_in addr;
+    lantern_fill_sockaddr(&addr, ip, port);
+    connect(s, (struct sockaddr *)&addr, sizeof(addr));
+
+    fd_set wset;
+    FD_ZERO(&wset); FD_SET(s, &wset);
+    struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    int open = 0;
+    if (select(0, NULL, &wset, NULL, &tv) > 0) {
+        int err = 0; int errlen = sizeof(err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
+        if (err == 0) open = 1;
+    }
+    closesocket(s);
+    return open;
+}
+
+/* Base64 encode a string. Returns bytes written (excluding null). */
+static int lantern_base64_encode(const char *input, char *output, size_t outlen) {
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int rawlen = (int)strlen(input);
+    int ei = 0;
+    for (int i = 0; i < rawlen; i += 3) {
+        if ((size_t)(ei + 4) >= outlen) break;
+        int b0 = (unsigned char)input[i];
+        int b1 = (i + 1 < rawlen) ? (unsigned char)input[i+1] : 0;
+        int b2 = (i + 2 < rawlen) ? (unsigned char)input[i+2] : 0;
+        output[ei++] = b64[(b0 >> 2) & 0x3F];
+        output[ei++] = b64[((b0 << 4) | (b1 >> 4)) & 0x3F];
+        output[ei++] = (i + 1 < rawlen) ? b64[((b1 << 2) | (b2 >> 6)) & 0x3F] : '=';
+        output[ei++] = (i + 2 < rawlen) ? b64[b2 & 0x3F] : '=';
+    }
+    if ((size_t)ei < outlen) output[ei] = '\0';
+    return ei;
+}
+
+/* HTTP GET request. Returns bytes received, or 0 on failure.
+   extra_headers can be NULL, or a string like "Authorization: Basic ...\r\n" */
+static int lantern_http_get(const char *host, uint16_t port, const char *path,
+                            const char *extra_headers, char *buf, size_t buflen) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+
+    struct sockaddr_in addr;
+    lantern_fill_sockaddr(&addr, host, port);
+    DWORD t = 3000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof(t));
+
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(s);
+        return 0;
+    }
+
+    char req[512];
+    snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\n%sConnection: close\r\n\r\n",
+             path, host, extra_headers ? extra_headers : "");
+    send(s, req, (int)strlen(req), 0);
+
+    int total = 0;
+    while (total < (int)buflen - 1) {
+        int n = recv(s, buf + total, (int)(buflen - 1 - (size_t)total), 0);
+        if (n <= 0) break;
+        total += n;
+    }
+    buf[total] = '\0';
+    closesocket(s);
+    return total;
+}
+
+/* HTTP GET with Basic Auth. Builds Authorization header from user:pass. */
+static int lantern_http_get_auth(const char *host, uint16_t port, const char *path,
+                                 const char *user, const char *pass,
+                                 char *buf, size_t buflen) {
+    char raw[128], encoded[256], header[320];
+    snprintf(raw, sizeof(raw), "%s:%s", user, pass);
+    lantern_base64_encode(raw, encoded, sizeof(encoded));
+    snprintf(header, sizeof(header), "Authorization: Basic %s\r\n", encoded);
+    return lantern_http_get(host, port, path, header, buf, buflen);
+}
+
+/* Extract HTTP status code from response (e.g. 200, 404). Returns 0 on parse failure. */
+static int lantern_http_status(const char *response) {
+    const char *p = strstr(response, "HTTP/");
+    if (!p) return 0;
+    p = strchr(p, ' ');
+    if (!p) return 0;
+    return atoi(p + 1);
+}
+
+/* Case-insensitive search for needle in the body of an HTTP response. */
+static int lantern_body_contains_ci(const char *response, const char *needle) {
+    const char *body = strstr(response, "\r\n\r\n");
+    if (!body) body = response;
+    else body += 4;
+    size_t nlen = strlen(needle);
+    for (const char *p = body; *p; p++) {
+        if (_strnicmp(p, needle, nlen) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Parse 802.11 Information Elements for WiFi security classification. */
+static const char *lantern_security_from_ies(const uint8_t *ies, ULONG ie_len) {
+    int has_rsn = 0, has_wpa = 0, akm_type = 0;
+    const uint8_t *p = ies, *end = ies + ie_len;
+
+    while (p + 2 <= end) {
+        uint8_t tag = p[0], len = p[1];
+        const uint8_t *body = p + 2;
+        if (body + len > end) break;
+
+        if (tag == 48 && len >= 12) {
+            has_rsn = 1;
+            ULONG off = 2 + 4;
+            if (off + 2 > len) goto lantern_ie_next;
+            uint16_t pw = body[off] | ((uint16_t)body[off+1] << 8);
+            off += 2 + (ULONG)pw * 4;
+            if (off + 2 > len) goto lantern_ie_next;
+            uint16_t ac = body[off] | ((uint16_t)body[off+1] << 8);
+            off += 2;
+            for (uint16_t i = 0; i < ac && off + 4 <= len; i++, off += 4) {
+                if (body[off]==0 && body[off+1]==0x0F && body[off+2]==0xAC) {
+                    int t = body[off+3];
+                    if (t > akm_type) akm_type = t;
+                }
+            }
+        } else if (tag == 221 && len >= 10) {
+            if (body[0]==0 && body[1]==0x50 && body[2]==0xF2 && body[3]==1)
+                has_wpa = 1;
+        }
+    lantern_ie_next:
+        p = body + len;
+    }
+
+    if (has_rsn) {
+        if (akm_type == 8 || akm_type == 18) return "WPA3-SAE";
+        if (akm_type == 1 || akm_type == 5)  return "WPA2-Enterprise";
+        return "WPA2-PSK";
+    }
+    return has_wpa ? "WPA" : "Open";
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif

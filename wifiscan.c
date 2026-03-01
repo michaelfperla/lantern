@@ -39,63 +39,7 @@ static const char *freq_band(ULONG freq_khz) {
     return "?";
 }
 
-/* Parse security from raw Information Elements in BSS entry.
-   RSN IE (tag 48) = WPA2/WPA3, WPA IE (tag 221 + MS OUI) = WPA1. */
-static const char *security_from_ies(const uint8_t *ies, ULONG ie_len) {
-    int has_rsn = 0, has_wpa = 0;
-    int akm_type = 0; /* best AKM seen */
-
-    const uint8_t *p = ies;
-    const uint8_t *end = ies + ie_len;
-
-    while (p + 2 <= end) {
-        uint8_t tag = p[0];
-        uint8_t len = p[1];
-        const uint8_t *body = p + 2;
-
-        if (body + len > end) break;
-
-        if (tag == 48 && len >= 12) {
-            /* RSN IE — WPA2/WPA3 */
-            has_rsn = 1;
-            /* Skip: version(2) + group cipher(4) + pairwise count(2) */
-            ULONG off = 2 + 4;
-            if (off + 2 > len) goto next;
-            uint16_t pw_count = body[off] | ((uint16_t)body[off+1] << 8);
-            off += 2 + (ULONG)pw_count * 4;
-            if (off + 2 > len) goto next;
-            uint16_t akm_count = body[off] | ((uint16_t)body[off+1] << 8);
-            off += 2;
-            for (uint16_t i = 0; i < akm_count && off + 4 <= len; i++, off += 4) {
-                /* OUI 00-0F-AC, type in body[off+3] */
-                if (body[off] == 0x00 && body[off+1] == 0x0F && body[off+2] == 0xAC) {
-                    int t = body[off+3];
-                    if (t > akm_type) akm_type = t;
-                }
-            }
-        } else if (tag == 221 && len >= 10) {
-            /* Vendor-specific — check for WPA OUI (00-50-F2 type 1) */
-            if (body[0] == 0x00 && body[1] == 0x50 &&
-                body[2] == 0xF2 && body[3] == 0x01) {
-                has_wpa = 1;
-            }
-        }
-
-    next:
-        p = body + len;
-    }
-
-    if (has_rsn) {
-        /* AKM type 8 = SAE (WPA3-Personal), 18 = SAE + transition */
-        if (akm_type == 8 || akm_type == 18) return "WPA3-SAE";
-        /* AKM type 1 = 802.1X, 5 = 802.1X-SHA256 */
-        if (akm_type == 1 || akm_type == 5)  return "WPA2-Enterprise";
-        /* AKM type 2 = PSK, 6 = PSK-SHA256 */
-        return "WPA2-PSK";
-    }
-    if (has_wpa) return "WPA";
-    return "Open";
-}
+/* security_from_ies now shared via lantern_security_from_ies() in lantern.h */
 
 static void signal_bars(long rssi, char *buf, size_t buflen) {
     int bars;
@@ -199,7 +143,7 @@ static void scan_wifi(void) {
 
             /* Parse security directly from this BSS entry's beacon IEs */
             const uint8_t *ies = (const uint8_t *)bss + bss->ulIeOffset;
-            const char *security = security_from_ies(ies, bss->ulIeSize);
+            const char *security = lantern_security_from_ies(ies, bss->ulIeSize);
 
             const char *sig_color;
             if (rssi >= -50)      sig_color = C_GREEN;
